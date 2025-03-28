@@ -2,12 +2,9 @@ import streamlit as st
 from supabase import create_client, Client
 import hashlib
 import pandas as pd
-import datetime
 import plotly.express as px
-import seaborn as sns
-import matplotlib.pyplot as plt
 import folium
-from streamlit_extras.metric_cards import style_metric_cards
+import streamlit.components.v1 as components
 
 # Supabase Credentials
 SUPABASE_URL = "https://nffvzlszgyqokibmcjkt.supabase.co"
@@ -41,21 +38,22 @@ def login_user(email, password):
     return response.data[0] if response.data else None
 
 # Function for new user admission (no role selection)
-def admit_user(name, email, password, role="Applicant"):
-    hashed_pw = hash_password(password)
+def admit_user(name, email, role="Applicant"):
     response = supabase.table("users").insert({
         "name": name,
         "email": email,
-        "password": hashed_pw,
-        "role": role
+        "password": hash_password("password"),  # placeholder password, user will reset.
+        "role": role,
     }).execute()
     return response.data if response.data else None
 
 # Function to update user information
-def update_user_info(user_id, name, email, role=None):
+def update_user_info(user_id, name, email, role=None, student_type=None):
     update_data = {"name": name, "email": email}
     if role:
         update_data["role"] = role
+    if student_type:
+        update_data["student_type"] = student_type
     response = supabase.table("users").update(update_data).eq("id", user_id).execute()
     return response.data if response.data else None
 
@@ -94,47 +92,97 @@ def registrar_dashboard():
 
     # Applicant List
     st.subheader("Applicant List")
-    applicants = supabase.table("users").select("id, name, email").eq("role", "Applicant").execute().data
 
-    if applicants:
-        df = pd.DataFrame(applicants)
-        df['Admit'] = False
-        df['Reject'] = False  # Add Reject checkbox column
-        edited_df = st.data_editor(
-            df,
-            column_config={
-                "Admit": st.column_config.CheckboxColumn(
-                    "Admit",
-                    help="Select to admit",
-                    default=False,
-                ),
-                "Reject": st.column_config.CheckboxColumn(
-                    "Reject",
-                    help="Select to reject",
-                    default=False,
-                ),
-            },
-            hide_index=True,
-        )
+    # Get all applicants
+    response = supabase.table("users").select("id, name, email").eq("role", "Applicant").execute()
+    applicants = response.data
 
-        selected_admit = edited_df[edited_df["Admit"]]
-        selected_reject = edited_df[edited_df["Reject"]]
+    if not applicants:
+        st.warning("No applicants found.")
+        return
 
-        if st.button("Process Selected Applicants"):
-            for index, row in selected_admit.iterrows():
-                update_user_info(row['id'], row['name'], row['email'], "Student")
-            for index, row in selected_reject.iterrows():
-                supabase.table("users").delete().eq("id", row['id']).execute()  # Delete rejected applicants
-            st.success("Selected applicants processed!")
-            st.rerun()
+    df_all_applicants = pd.DataFrame(applicants)
+    st.write("Columns in df_all_applicants:", df_all_applicants.columns)  # Debug
+
+    # Fetch details for Freshmen and Returnee applicants
+    try:
+        freshmen_details_result = supabase.table("applicant_freshmen_details").select("*").in_("user_email", df_all_applicants["email"].tolist()).execute()
+        freshmen_details = freshmen_details_result.data
+    except KeyError as e:
+        st.error(f"Error fetching freshmen details: {e}. Ensure 'email' column exists in applicant data.")
+        return
+
+    try:
+        returnee_details = supabase.table("applicant_returnee_details").select("*").in_("user_email", df_all_applicants["email"].tolist()).execute().data
+    except KeyError as e:
+        st.error(f"Error fetching returnee details: {e}. Ensure 'email' column exists in applicant data.")
+        return
+
+    df_freshmen_details = pd.DataFrame(freshmen_details)
+    df_returnee_details = pd.DataFrame(returnee_details)
+
+    # Merge dataframes
+    if df_freshmen_details.empty:
+        st.warning("No freshmen applicant details found.")
+        df_freshmen_merged = df_all_applicants  # skip merge
+    elif 'user_email' not in df_freshmen_details.columns:
+        st.error("Error: 'user_email' column not found in freshmen details.")
+        return  # Stop execution if 'user_email' is missing
     else:
-        st.write("No Applicants Found.")
+        try:
+            df_freshmen_merged = pd.merge(df_all_applicants, df_freshmen_details, left_on="email",
+                                          right_on="user_email", suffixes=('', '_freshmen'), how='left')
+        except KeyError as e:
+            st.error(f"Error during merge: {e}")
+            return  # Stop execution if merge fails
+
+    df_returnee_merged = pd.merge(df_all_applicants, df_returnee_details, left_on="email",
+                                  right_on="user_email", suffixes=('', '_returnee'), how='left')
+
+    # Combine dataframes with indicator for student type
+    df_combined = pd.concat([df_freshmen_merged, df_returnee_merged], ignore_index=True)
+    df_combined['student_type'] = df_combined['student_type'].fillna(
+        df_combined['student_type_freshmen']).fillna(df_combined['student_type_returnee'])
+    df_combined = df_combined.drop(['student_type_freshmen', 'student_type_returnee'], axis=1)
+
+    # Search Bar
+    search_term = st.text_input("Search Applicants", "")
+
+    # Filter Data
+    if search_term:
+        df_combined = df_combined[df_combined.apply(
+            lambda row: search_term.lower() in ' '.join(row.astype(str).values).lower(), axis=1)]
+
+    # Display Combined Table
+    st.dataframe(df_combined)
+
+    df_combined['Admit as Student'] = False
+    df_combined['Reject'] = False
+    edited_df_combined = st.data_editor(
+        df_combined,
+        column_config={
+            "Admit as Student": st.column_config.CheckboxColumn(
+                "Admit as Student", help="Select to admit as student", default=False),
+            "Reject": st.column_config.CheckboxColumn("Reject", help="Select to reject", default=False),
+        },
+        hide_index=True,
+    )
+
+    selected_admit_combined = edited_df_combined[edited_df_combined["Admit as Student"]]
+    selected_reject_combined = edited_df_combined[edited_df_combined["Reject"]]
+
+    if st.button("Process Applicants"):
+        for index, row in selected_admit_combined.iterrows():
+            update_user_info(row['id'], row['name'], row['email'], "Student", row['student_type'])
+        for index, row in selected_reject_combined.iterrows():
+            supabase.table("users").delete().eq("id", row['id']).execute()
+        st.success("Applicants processed!")
+        st.rerun()
 
 def professor_management():
     st.subheader("Professor Management")
     professors = supabase.table("users").select("id, name, email").eq("role", "Professor").execute().data
     df = pd.DataFrame(professors)
-
     st.dataframe(df)
 
     for prof in professors:
@@ -149,7 +197,7 @@ def professor_management():
     prof_email = st.text_input("Professor Email")
     prof_password = st.text_input("Professor Password", type="password")
     if st.button("Add Professor", key="add_prof"):
-        admit_user(prof_name, prof_email, prof_password, "Professor")
+        admit_user(prof_name, prof_email, "Professor")
         st.success("Professor added!")
         st.rerun()
 
@@ -277,7 +325,8 @@ def edit_subject(subject_id):
             new_subject_title = st.text_input("New Subject Title", value="")
 
         if "subject_description" in edit_subject_data:
-            new_subject_description = st.text_input("New Subject Description", value=edit_subject_data["subject_description"])
+            new_subject_description = st.text_input("New Subject Description",
+                                                    value=edit_subject_data["subject_description"])
         else:
             st.warning("Subject Description not found in database.")
             new_subject_description = st.text_input("New Subject Description", value="")
@@ -317,7 +366,7 @@ def student_dashboard():
     # Example: Display a map using Folium
     m = folium.Map(location=[37.7749, -122.4194], zoom_start=12)  # San Francisco coordinates
     folium.Marker([37.7749, -122.4194], popup="Student Location").add_to(m)
-    st.components.v1.html(folium.Figure().add_child(m)._repr_html_(), width=700, height=500)
+    st.components.v1.html(folium.Figure().add_child(m)._repr_html_(), width=700)
 
 # User Icon & Profile Access (Top-Right)
 def user_icon():
@@ -348,6 +397,8 @@ def main():
         st.session_state.show_admission_form = False
     if "admission_submitted" not in st.session_state:
         st.session_state.admission_submitted = False  # Track submission
+    if "student_type" not in st.session_state:
+        st.session_state.student_type = None
 
     # Sidebar Navigation
     st.sidebar.title("Navigation")
@@ -373,95 +424,9 @@ def main():
                     st.error("Invalid credentials")
 
         elif choice == "Admission":
-            st.subheader("Data Privacy Policy Consent")
-            st.write("DATA PRIVACY POLICY CONSENT")
-            st.write("From School")
-            st.write("I have read and understood all the provisions of the School Data Privacy Notice School and agree with its full implementation.")
-            st.write("I hereby give my consent to School for the collection and processing of my personal data, relating to my Academic record, in accordance with the School Data Privacy Notice forSchool and in compliance with Republic Act 10173 or the Data Privacy Act of 2012 of the Republic of the Philippines, its implementing Rules and Regulations, and other guidelines and issuances by the National Privacy Commission.")
-            consent = st.checkbox("I agree to the Data Privacy Policy.")
+            consent_page()
 
-            if consent:
-                st.session_state.consent_given = True
-                st.session_state.show_admission_form = True
-
-                if not st.session_state.admission_submitted:  # Show form only if not submitted
-                    st.subheader("New Student Admission")
-                    st.subheader("Personal Information")
-                    first_name = st.text_input("First Name", key="first_name_admission")
-                    middle_name = st.text_input("Middle Name (Optional)", key="middle_name_admission")
-                    last_name = st.text_input("Last Name", key="last_name_admission")
-                    suffix = st.text_input("Suffix (Optional)", key="suffix_admission")
-                    dob = st.date_input("Date of Birth", key="dob_admission")
-                    gender = st.selectbox("Gender", ["Male", "Female", "Other"], key="gender_admission")
-                    citizenship = st.text_input("Citizenship", key="citizenship_admission")
-                    email = st.text_input("Email", key="email_admission")
-                    phone = st.text_input("Phone Number", key="phone_admission")
-                    address = st.text_area("Address", key="address_admission")
-
-                    st.subheader("Academic Information")
-                    last_school = st.text_input("Last School Attended", key="last_school_admission")
-                    year_graduated = st.number_input("Year Graduated", min_value=1900, max_value=2100, step=1, key="year_graduated_admission")
-                    academic_achievements = st.text_area("Academic Achievements", key="academic_achievements_admission")
-
-                    st.subheader("Guardian Information")
-                    guardian_name = st.text_input("Parent/Guardian Name", key="guardian_name_admission")
-                    guardian_phone = st.text_input("Contact Number", key="guardian_phone_admission")
-                    relationship = st.text_input("Relationship", key="relationship_admission")
-
-                    st.subheader("Documents for Upload")
-                    birth_certificate = st.file_uploader("Birth Certificate", type=["pdf", "png", "jpg", "jpeg"], key="birth_certificate_admission")
-                    report_card = st.file_uploader("Report Card/Transcript of Records", type=["pdf", "png", "jpg", "jpeg"], key="report_card_admission")
-                    good_moral = st.file_uploader("Certificate of Good Moral Character", type=["pdf", "png", "jpg", "jpeg"], key="good_moral_admission")
-
-                    if st.button("Register", key="admit"):
-
-                        # Validation: Check if all required fields are filled
-                        if not all([first_name, last_name, dob, gender, citizenship, email, phone, address,
-                                    last_school, year_graduated, academic_achievements,
-                                    guardian_name, guardian_phone, relationship,
-                                    birth_certificate, report_card, good_moral]):
-                            st.error("Please fill in all required fields and upload all documents.")
-                        else:
-                            # Construct the full name, handling optional parts correctly
-                            full_name_parts = [first_name, last_name, middle_name, suffix]
-                            full_name = " ".join(part for part in full_name_parts if part).strip()
-
-                            if admit_user(full_name, email, "password"): #use full_name. change password to a placeholder, as user did not input password
-                                # ... (rest of the file upload and Supabase insert code) ...
-
-                                # Insert applicant details into the "applicant_details" table
-                                applicant_data = {
-                                    "user_email": email,  # Link to the user's email
-                                    "full_name": full_name, #use full_name
-                                    "date_of_birth": dob.strftime("%Y-%m-%d"),
-                                    "gender": gender,
-                                    "citizenship": citizenship,
-                                    "phone_number": phone,
-                                    "address": address,
-                                    "last_school_attended": last_school,
-                                    "year_graduated": year_graduated,
-                                    "academic_achievements": academic_achievements,
-                                    "guardian_name": guardian_name,
-                                    "guardian_phone": guardian_phone,
-                                    "relationship": relationship,
-                                }
-                                supabase.table("applicant_details").insert(applicant_data).execute()
-
-                                st.success("Registration successful! You can now log in.")
-                                st.session_state.show_admission_form = False
-                                st.session_state.admission_submitted = True #set to true after submission
-                            else:
-                                st.error("Email already exists. Try another one.")
-                else:
-                    if st.session_state.show_admission_form:
-                        if st.session_state.admission_submitted:
-                            st.success("Your Application has been submitted")
-                        else :
-                            st.session_state.show_admission_form = False
-                    if st.session_state.consent_given:
-                        st.session_state.consent_given = False
-
-    # Redirect to the correct dashboard based on role
+        # Redirect to the correct dashboard based on role
     if st.session_state.user:
         role = st.session_state.user["role"]
         if role == "Admin":
@@ -482,6 +447,157 @@ def main():
             student_dashboard()
         elif role == "Applicant":
             st.warning("Your application is under review.")
+
+def consent_page():
+    st.subheader("Data Privacy Policy Consent")
+    st.write("DATA PRIVACY POLICY CONSENT")
+    st.write("From School")
+    st.write("I have read and understood all the provisions of the School Data Privacy Notice School and agree with its full implementation.")
+    st.write("I hereby give my consent to School for the collection and processing of my personal data, relating to my Academic record, in accordance with the School Data Privacy Notice forSchool and in compliance with Republic Act 10173 or the Data Privacy Act of 2012 of the Republic of the Philippines, its implementing Rules and Regulations, and other guidelines and issuances by the National Privacy Commission.")
+    consent = st.checkbox("I agree to the Data Privacy Policy.")
+
+    if consent:
+        st.session_state.consent_given = True
+        student_type_selection() #Call student type selection
+
+def student_type_selection():
+    st.subheader("Select Student Type")
+    student_type = st.radio("Student Type", ["Freshmen Student", "Returnee Student"])
+    st.session_state.student_type = student_type
+    admission_form() #Call admission form function
+
+def admission_form():
+    if st.session_state.student_type == "Freshmen Student":
+        freshmen_form()
+    elif st.session_state.student_type == "Returnee Student":
+        returnee_form()
+
+def freshmen_form():
+    st.subheader("New Student Admission (Freshmen)")
+    st.subheader("Personal Information")
+    first_name = st.text_input("First Name", key="first_name_admission")
+    middle_name = st.text_input("Middle Name (Optional)", key="middle_name_admission")
+    last_name = st.text_input("Last Name", key="last_name_admission")
+    suffix = st.text_input("Suffix (Optional)", key="suffix_admission")
+    dob = st.date_input("Date of Birth", key="dob_admission")
+    gender = st.selectbox("Gender", ["Male", "Female", "Other"], key="gender_admission")
+    citizenship = st.text_input("Citizenship", key="citizenship_admission")
+    email = st.text_input("Email", key="email_admission")
+    phone = st.text_input("Phone Number", key="phone_admission")
+    address = st.text_area("Address", key="address_admission")
+
+    st.subheader("Academic Information")
+    last_school = st.text_input("Last School Attended", key="last_school_admission")
+    year_graduated = st.number_input("Year Graduated", min_value=1900, max_value=2100, step=1, key="year_graduated_admission")
+    academic_achievements = st.text_area("Academic Achievements", key="academic_achievements_admission")
+
+    st.subheader("Guardian Information")
+    guardian_name = st.text_input("Parent/Guardian Name", key="guardian_name_admission")
+    guardian_phone = st.text_input("Contact Number", key="guardian_phone_admission")
+    relationship = st.text_input("Relationship", key="relationship_admission")
+
+    st.subheader("Documents for Upload")
+    birth_certificate = st.file_uploader("Birth Certificate", type=["pdf", "png", "jpg", "jpeg"], key="birth_certificate_admission")
+    report_card = st.file_uploader("Report Card/Transcript of Records", type=["pdf", "png", "jpg", "jpeg"], key="report_card_admission")
+    good_moral = st.file_uploader("Certificate of Good Moral Character", type=["pdf", "png", "jpg", "jpeg"], key="good_moral_admission")
+
+    if st.button("Register", key="admit"):
+        # Validation: Check if all required fields are filled
+        if not all([first_name, last_name, dob, gender, citizenship, email, phone, address,
+                    last_school, year_graduated, academic_achievements,
+                    guardian_name, guardian_phone, relationship,
+                    birth_certificate, report_card, good_moral]):
+            st.error("Please fill in all required fields and upload all documents.")
+        else:
+            # Construct the full name, handling optional parts correctly
+            full_name_parts = [first_name, last_name, middle_name, suffix]
+            full_name = " ".join(part for part in full_name_parts if part).strip()
+
+            if admit_user(full_name, email, "Applicant"): #use full_name. change password to a placeholder, as user did not input password
+                # Insert applicant details into the "applicant_details" table
+                applicant_data = {
+                    "user_email": email,  # Link to the user's email
+                    "full_name": full_name, #use full_name
+                    "date_of_birth": dob.strftime("%Y-%m-%d"),
+                    "gender": gender,
+                    "citizenship": citizenship,
+                    "phone_number": phone,
+                    "address": address,
+                    "last_school_attended": last_school,
+                    "year_graduated": year_graduated,
+                    "academic_achievements":academic_achievements,
+                    "guardian_name": guardian_name,
+                    "guardian_phone": guardian_phone,
+                    "relationship": relationship,
+                    "student_type": "Freshmen Student",
+                }
+                supabase.table("applicant_freshmen_details").insert(applicant_data).execute()
+
+                st.success("Registration successful! You can now log in.")
+                st.session_state.show_admission_form = False
+                st.session_state.admission_submitted = True #set to true after submission
+            else:
+                st.error("Email already exists. Try another one.")
+
+def returnee_form():
+    st.subheader("New Student Admission (Returnee)")
+    st.subheader("Personal Information")
+    first_name = st.text_input("First Name", key="first_name_returnee")
+    middle_name = st.text_input("Middle Name (Optional)", key="middle_name_returnee")
+    last_name = st.text_input("Last Name", key="last_name_returnee")
+    suffix = st.text_input("Suffix (Optional)", key="suffix_returnee")
+    dob = st.date_input("Date of Birth", key="dob_returnee")
+    address = st.text_area("Current Address", key="address_returnee")
+
+    st.subheader("Contact Details")
+    phone = st.text_input("Phone Number", key="phone_returnee")
+    email = st.text_input("Email", key="email_returnee")
+
+    st.subheader("Academic Records (Upload Image)")
+    tor = st.file_uploader("Transcript of Records (TOR)", type=["png", "jpg", "jpeg"], key="tor_returnee")
+    last_enrollment = st.file_uploader("Certificate of Last Enrollment", type=["png", "jpg", "jpeg"], key="last_enrollment_returnee")
+    clearance = st.file_uploader("Returnee Clearance Form", type=["png", "jpg", "jpeg"], key="clearance_returnee")
+    good_moral = st.file_uploader("Good Moral Certificate", type=["png", "jpg", "jpeg"], key="good_moral_returnee")
+
+    st.subheader("Old University Details")
+    prev_univ_name = st.text_input("Name of Previous University", key="prev_univ_name_returnee")
+    prev_univ_address = st.text_area("University Address", key="prev_univ_address_returnee")
+    last_year_attended = st.number_input("Last Year Attended", min_value=1900, max_value=2100, step=1, key="last_year_attended_returnee")
+    course = st.text_input("Course/Program Enrolled", key="course_returnee")
+    semesters_completed = st.number_input("Number of Semesters Completed", min_value=1, step=1, key="semesters_completed_returnee")
+
+    reason_options = ["Academic Break", "Financial Reasons", "Transferring to Another University", "Medical Leave", "Other Personal Reasons"]
+    reason_leaving = st.selectbox("Reason for Leaving", reason_options, key="reason_leaving_returnee")
+
+    if st.button("Register", key="admit_returnee"):
+        if not all([first_name, last_name, dob, address, phone, email, tor, last_enrollment, clearance, good_moral, prev_univ_name, prev_univ_address, last_year_attended, course, semesters_completed, reason_leaving]):
+            st.error("Please fill in all required fields and upload all documents.")
+        else:
+            full_name_parts = [first_name, last_name, middle_name, suffix]
+            full_name = " ".join(part for part in full_name_parts if part).strip()
+
+            if admit_user(full_name, email, "password", role="Applicant"):
+                applicant_data = {
+                    "user_email": email,
+                    "full_name": full_name,
+                    "date_of_birth": dob.strftime("%Y-%m-%d"),
+                    "phone_number": phone,
+                    "address": address,
+                    "previous_university_name": prev_univ_name,
+                    "previous_university_address": prev_univ_address,
+                    "last_year_attended": last_year_attended,
+                    "course_program_enrolled": course,
+                    "semesters_completed": semesters_completed,
+                    "reason_leaving": reason_leaving,
+                    "student_type": st.session_state.student_type,
+                }
+                supabase.table("applicant_details").insert(applicant_data).execute()
+
+                st.success("Registration successful! You can now log in.")
+                st.session_state.show_admission_form = False
+                st.session_state.admission_submitted = True
+            else:
+                st.error("Email already exists. Try another one.")
 
 if __name__ == "__main__":
     main()
