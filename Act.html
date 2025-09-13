@@ -1,0 +1,33 @@
+<!DOCTYPE html>
+<html>
+<head>
+  <title>Simple Cube</title>
+</head>
+<body>
+<canvas id="canvas" width="400" height="400" style="border:1px solid black;"></canvas>
+
+<script>
+const canvas = document.getElementById("canvas");
+const ctx = canvas.getContext("2d");
+
+function drawCube(x, y, size) {
+  // Front face
+  ctx.strokeRect(x, y, size, size);
+  
+  // Back face
+  ctx.strokeRect(x + 30, y - 30, size, size);
+  
+  // Connect corners
+  ctx.beginPath();
+  ctx.moveTo(x,y);           ctx.lineTo(x + 30, y - 30);
+  ctx.moveTo(x + size, y);    ctx.lineTo(x + size + 30, y - 30);
+  ctx.moveTo(x, y + size);    ctx.lineTo(x + 30, y + size - 30);
+  ctx.moveTo(x + size, y + size); ctx.lineTo(x + size + 30, y + size - 30);
+  ctx.stroke();
+}
+
+// Draw cube
+drawCube(100, 150, 100);
+</script>
+</body>
+</html>
